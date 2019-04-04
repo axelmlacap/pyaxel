@@ -16,7 +16,7 @@ from tkinter import Tk, filedialog
 import sys, os, errno
 from os import listdir
 from os import linesep
-from os.path import normpath, join
+from os.path import normpath, join, abspath
 
 ureg = UnitRegistry()
 Q_ = ureg.Quantity
@@ -30,9 +30,22 @@ types = {"s": str,
 class PATH:
     pass
 
-class FN_VAR:
+class ATTR:
     def __init__(self, name):
         self.name = str(name)
+
+class FNVAR:
+    def __init__(self, name):
+        self.name = str(name)
+
+class CALVAR:
+    def __init__(self, name):
+        self.name = str(name)
+
+class REDVAR:
+    def __init__(self, name):
+        self.name = str(name)
+
 
 def split_path(path):
     from os.path import split, splitext
@@ -235,7 +248,7 @@ class Var:
         self.dtype = dtype
         
         if value is None:
-            self.value = np.zeros((length, ), dtype=self.dtype)
+            self.value = np.array(np.zeros((length, ), dtype=self.dtype), ndmin=1)
             self._length = length
         else:
             self.value = value
@@ -274,8 +287,8 @@ class Var:
     def dtype(self, value):
         if not isinstance(value, type):
             raise TypeError("Dtype must be a valid type.")
-        elif value is str:
-            value = object
+#        elif value is str:
+#            value = object
         
         self._dtype = value
     
@@ -293,7 +306,7 @@ class Var:
         elif value > self.length:
             self._value = np.append(self._value, np.zeros((value-self.length, ), dtype=self.dtype))
         elif value < self.length:
-            self._value = self._value[0:value-1]
+            self._value = self._value[0:value]
     
     @property
     def value(self):
@@ -304,7 +317,8 @@ class Var:
     
     @value.setter
     def value(self, value):
-        value = np.array(value, ndmin=1).astype(self.dtype)
+        dtype = self.dtype if (self.dtype is not str) else object # Set dtype to object if string was specified. This allows numpy arrays of strings with variable lengths
+        value = np.array(value, ndmin=1).astype(dtype)
         self._value = value
 
 
@@ -354,6 +368,13 @@ class VarGroup:
         
         return cls(*tuple(vars))
     
+    @classmethod
+    def copy(cls, var_group, length=None):
+        if not length:
+            length = var_group.length
+        
+        return VarGroup.from_props(var_group.names, var_group.dtypes, length=length)
+    
     def __getitem__(self, key):
         if isinstance(key, str):
             return self._vars[key]
@@ -363,7 +384,7 @@ class VarGroup:
             for var in self._vars.values():
                 new_vars.append(var[key])
             
-            return self.__class__(tuple(new_vars))
+            return self.__class__(*tuple(new_vars))
     
     def __setitem__(self, key, value):
         if isinstance(key, str):
@@ -381,12 +402,8 @@ class VarGroup:
         return iter(self._vars.values())
     
     def __repr__(self):
-        string = "{"
-        
-        for key, val in self._vars.items():
-            string += "'" + key + "': " + val.value.__repr__() + "," + linesep
-        
-        string += "}"
+        string = (linesep + " ").join(["'{}': {}".format(key, val.value.__repr__()) for key,val in self._vars.items()])
+        string = "{" + string + "}"
         
         return string
     
@@ -396,16 +413,14 @@ class VarGroup:
     
     @length.setter
     def length(self, value):
-        value = int(value)
-        
         # If new value is the same as before, do nothing
         if value == self.length:
             return
         # Else, change all lengths
         else:
+            self._length = value
             for var_name in self._vars.keys():
                 self._vars[var_name].length = value
-            self._length = value
     
     @property
     def nvars(self):
@@ -494,8 +509,10 @@ class FNSyntax:
         for idx, var in enumerate(self.vars):
             try:
                 fn_vars[var.name] = "".join(split(self.re_conditions[var.name], filename))
-            except:
-                raise ValueError("Falied to parse filename '{}' for variable '{}' with condition '{}'.".format(filename, var.name, self.re_conditions[var.name]))
+            except Exception as e:
+                string = "Falied to parse filename '{}' for variable '{}' with condition '{}'. Original exception was:".format(filename, var.name, self.re_conditions[var.name]) + linesep + linesep
+                string += "{}: {}".format(e.__class__.__name__, e)
+                raise ValueError(string)
         
         return fn_vars
 
@@ -579,7 +596,7 @@ class FileGroup(object):
     def __init__(self, files=None, fn_syntax=None):
         self.clear()
         
-        if not files:
+        if files is None:
             self.files = file_dialog_open(batch=True)
         else:
             self.files = files
@@ -597,9 +614,25 @@ class FileGroup(object):
         else:
             raise StopIteration
     
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self.files[key]
+        elif isinstance(key, slice) or isinstance(key, np.ndarray):
+            return self.__class__(files=self.files[key], fn_syntax=self.fn_syntax)
+        else:
+            raise KeyError("File group subscript must be either int or slice type.")
+    
+    def __setitem__(self, key, value):
+        if isinstance(key, int) or isinstance(key, slice):
+            self.files[key] = value
+        else:
+            raise KeyError("File group assignement key must be either int or slice type.")
+    
     @classmethod
     def from_directory(cls, path=None, fn_syntax=None):
-        if not path:
+        if path:
+            path = abspath(path)
+        else:
             path = file_dialog_dir_open()
         
         files = listdir(path)
@@ -628,7 +661,7 @@ class FileGroup(object):
     def files(self, value):
         if isinstance(value, type(None)):
             self.clear()
-        elif isinstance(value, list) or isinstance(value, str) or isinstance(value, File):
+        elif isinstance(value, np.ndarray) or isinstance(value, list) or isinstance(value, str) or isinstance(value, File):
             self.clear()
             self.append(value)
         else:
@@ -659,13 +692,15 @@ class FileGroup(object):
         self._fn_vars = self.collect_fn_vars()
     
     def collect_fn_vars(self):
-        fn_vars = self.fn_syntax.vars
-        fn_vars.length = self.length
-        
-        for idx, file in enumerate(self.files):
-            fn_vars[idx] = file.fn_vars
-        
-        return fn_vars
+        if self.fn_syntax is None:
+            return None
+        else:
+            fn_vars = VarGroup.copy(self.fn_syntax.vars, length=self.length)
+            
+            for idx, file in enumerate(self.files):
+                fn_vars[idx] = file.fn_vars
+            
+            return fn_vars
     
     @property
     def fn_vars(self):
@@ -673,9 +708,9 @@ class FileGroup(object):
     
     def append(self, files):
         # Verify if all elements from files are File objects or strings
-        if not files:
+        if files is None:
             return None
-        if isinstance(files, list):
+        if isinstance(files, list) or isinstance(files, np.ndarray):
             if not all([isinstance(x, str) or isinstance(x, File) for x in files]):
                 raise TypeError("File list must be a list of File objects or strings with valid paths")
         else:
@@ -683,15 +718,14 @@ class FileGroup(object):
         
         for value in files:
             if isinstance(value, str):
-                self._files.append(File(path=value))
-                self._paths.append(self.files[-1].path)
-            elif isinstance(value, File):
-                self._files.append(value)
-                self._paths.append(value.path)
+                value = File(path=value)
+            
+            self._files = np.append(self._files, value)
+            self._paths = np.append(self.files, value.path)
     
     def clear(self):
-        self._files = []
-        self._paths = []
+        self._files = np.array([], dtype=object, ndmin=1)
+        self._paths = np.array([], dtype=object, ndmin=1)
         self._fn_syntax = None
 
 
@@ -711,9 +745,9 @@ class BatchTask:
             syntax specified, this argument is ignored.
         callback: Python callable
             Callback function that will be called for each file. Its returns
-            will maped as output_vars specifies and its arguments will be
+            will maped as callback_vars specifies and its arguments will be
             passed as *args and **kwargs specifies (see below)
-        output_vars: tuple or VarGroup
+        callback_vars: tuple or VarGroup
             Return variables of callback function, passed either as a VarGroup
             object or a tuple which can be used for VarGroup object
             initialization. The values returned by callback for each call will
@@ -722,7 +756,7 @@ class BatchTask:
             Arguments and keyword-arguments that will be passed to callback.
             They can be any Python object. When a PATH instance is specified in
             any position, the path of the file under processing is inserted in
-            those positions at every callback call. When a FN_VAR instance
+            those positions at every callback call. When a FNVAR instance
             (which has a specified name) is passed in any position, the value
             of the filename variable that matches the specified name will be
             inserted in that position at every callback call.
@@ -742,47 +776,54 @@ class BatchTask:
         fg = FileGroup(['user=Pablo,age=10.txt'])
         fn_syntax = FNSyntax("user=", Var("User", str), ",age=", Var("Age", float), ".txt")
         
-        output_vars = VarGroup(Var("Path", str), Var("Is Underage", bool))
+        callback_vars = VarGroup(Var("Path", str), Var("Is Underage", bool))
         
         bt = BatchTask(fg,    # files to be processed
                        fn_syntax,    # filename syntax
                        is_underage,    # callback function
-                       output_vars,    # output variables
-                       PATH(), FN_VAR("User"), age=FN_VAR("Age"), do_print=True    # arguments and keyword-arguments to be passed to callback function
+                       callback_vars,    # output variables
+                       PATH(), FNVAR("User"), age=FNVAR("Age"), do_print=True    # arguments and keyword-arguments to be passed to callback function
                        )
         bt.run()
         
-        print(bt.output_vars)
-        print(bt.output_vars["Is Underage"].value)
+        print(bt.callback_vars)
+        print(bt.callback_vars["Is Underage"].value)
         
     """
     
-    def __init__(self, files, fn_syntax=None, callback=None, output_vars=None, *args, **kwargs):
+    def __init__(
+            self, files,
+            fn_syntax=None,
+            callback=None,
+            callback_args=None,
+            callback_kwargs=None,
+            callback_vars=None,
+            reduction=None,
+            reduction_args=None,
+            reduction_kwargs=None,
+            reduction_vars=None,
+            keep_callback_returns=None
+            ):
         
         self.files = files
         if fn_syntax:
             self.files.fn_syntax = fn_syntax
+        self.fn_vars = self.files.fn_vars
+            
         self.callback = callback
-        self.callback_args = args
-        self.callback_kwargs = kwargs
-        self.output_vars = output_vars
-    
-    @property
-    def output_vars(self):
-        return self._output_vars
-    
-    @output_vars.setter
-    def output_vars(self, value):
-        if value is None:
-            self._output_vars = VarGroup.from_props(name="return", dtype=type(None), length=self.length)
-        if isinstance(value, VarGroup):
-            self._output_vars = value
-            self._output_vars.length = self.length
-        elif isinstance(value, tuple):
-            self._output_vars = VarGroup(*value)
-            self._output_vars.length = self.length
+        self.callback_args = callback_args
+        self.callback_kwargs = callback_kwargs
+        self.callback_vars = callback_vars
+        
+        self.reduction = reduction
+        self.reduction_args = reduction_args
+        self.reduction_kwargs = reduction_kwargs
+        self.reduction_vars = reduction_vars
+        
+        if not (keep_callback_returns is None):
+            self.keep_callback_returns = keep_callback_returns
         else:
-            raise TypeError("Output variables argument must be either VarGroup type or a tuple with Var objects.")
+            self.keep_callback_returns = not bool(self.reduction)
     
     @property
     def files(self):
@@ -801,54 +842,154 @@ class BatchTask:
     def length(self):
         return self.files.length
     
+    @property
+    def keep_callback_returns(self):
+        return self._keep_callback_returns
+    
+    @keep_callback_returns.setter
+    def keep_callback_returns(self, value):
+        if not isinstance(value, bool):
+            return TypeError("Keep callback returns value must be bool type.")
+        
+        self._keep_callback_returns = value
+        
+        if value:
+            self.callback_vars.length = self.length
+        else:
+            self.callback_vars.length = 1
+    
+    @property
+    def callback_vars(self):
+        return self._callback_vars
+    
+    @callback_vars.setter
+    def callback_vars(self, value):
+        if value is None:
+            self._callback_vars = VarGroup.from_props(names=["output"], dtypes=[type(None)], length=self.length)
+        elif isinstance(value, VarGroup):
+            self._callback_vars = value
+            self._callback_vars.length = self.length
+        elif isinstance(value, Var):
+            self._callback_vars = VarGroup(value)
+            self._callback_vars.length = self.length
+        elif isinstance(value, tuple):
+            self._callback_vars = VarGroup(*value)
+            self._callback_vars.length = self.length
+        else:
+            raise TypeError("Output variables argument must be either VarGroup type or a tuple with Var objects.")
+    
+    @property
+    def reduction_vars(self):
+        return self._reduction_vars
+    
+    @reduction_vars.setter
+    def reduction_vars(self, value):
+        if value is None:
+            self._reduction_vars = VarGroup.from_props(names=["reduction"], dtypes=[type(None)], length=self.length)
+        elif isinstance(value, VarGroup):
+            self._reduction_vars = value
+            self._reduction_vars.length = 1
+        elif isinstance(value, Var):
+            self._reduction_vars = VarGroup(value)
+            self._reduction_vars.length = 1
+        elif isinstance(value, tuple):
+            self._reduction_vars = VarGroup(*value)
+            self._reduction_vars.length = 1
+        else:
+            raise TypeError("Reduction variables argument must be either VarGroup type or a tuple with Var objects.")
+    
+    def set_callback(self, function, args=None, kwargs=None, return_vars=None, keep_callback_returns=None):
+        self.callback = function
+        self.callback_args = args
+        self.callback_kwargs = kwargs
+        self.callback_vars = return_vars
+        
+        if not (keep_callback_returns is None):
+            self.keep_callback_returns = not bool(self.reduction)
+    
+    def set_reduction(self, function, args=None, kwargs=None, return_vars=None, keep_callback_returns=False):
+        self.reduction = function
+        self.reduction_args = args
+        self.reduction_kwargs = kwargs
+        self.reduction_vars = return_vars
+        
+        if not (keep_callback_returns is None):
+            self.keep_callback_returns = not bool(self.reduction)
+    
+    def insert_args(self, args, file_index):
+        if args:
+            args = list(args)
+        else:
+            args = []
+        
+        for index, arg in enumerate(args):
+            if isinstance(arg, PATH):
+                args[index] = self.files[file_index].path
+            if isinstance(arg, ATTR):
+                args[index] = self.__getattribute__(arg.name)
+            if isinstance(arg, FNVAR):
+                args[index] = self.files[file_index].fn_vars[arg.name].value
+            if isinstance(arg, CALVAR):
+                args[index] = self.callback_vars[file_index][arg.name].value
+            if isinstance(arg, REDVAR):
+                args[index] = self.reduction_vars[arg.name].value
+        
+        return tuple(args)
+    
+    def insert_kwargs(self, kwargs, file_index):
+        if kwargs:
+            kwargs = dict(kwargs)
+        else:
+            kwargs = {}
+        
+        for index, (key, value) in enumerate(kwargs.items()):
+            if isinstance(value, PATH):
+                kwargs[key] = self.files[file_index].path
+            if isinstance(value, ATTR):
+                kwargs[key] = self.__getattribute__(value.name)
+            if isinstance(value, FNVAR):
+                kwargs[key] = self.files[file_index].fn_vars[value.name].value
+            if isinstance(value, CALVAR):
+                kwargs[key] = self.callback_vars[file_index][value.name].value
+            if isinstance(value, REDVAR):
+                kwargs[key] = self.reduction_vars[value.name].value
+        
+        return kwargs
+    
+    def call(self, function, args, kwargs, return_vars):
+        return_vars = VarGroup.copy(return_vars, length=1)
+        ret = function(*args, **kwargs)
+        
+        if return_vars.nvars == 1:
+            ret = [ret]
+        
+        for position, key in enumerate(return_vars._vars.keys()):
+            return_vars[key].value = ret[position]
+        
+        return return_vars
+    
     def run(self):
         for idx, file in enumerate(self.files):
             print("Processing file {} of {}: {}'{}'".format(idx+1, self.files.length, os.linesep, file.path) + linesep)
             
-            callback_args = self.insert_callback_args(self.callback_args, file.path, file.fn_vars)
-            callback_kwargs = self.insert_callback_kwargs(self.callback_kwargs, file.path, file.fn_vars)
+            # Main callback
+            callback_args = self.insert_args(self.callback_args, idx)
+            callback_kwargs = self.insert_kwargs(self.callback_kwargs, idx)
             
-            ret = self.callback(file.path, *callback_args, **callback_kwargs)
+            this_idx = idx if self.keep_callback_returns else 0 # Override index to override callback returns
+            self.callback_vars[this_idx] = self.call(function=self.callback,
+                                                   args=callback_args,
+                                                   kwargs=callback_kwargs,
+                                                   return_vars=self.callback_vars)
             
-            if self.output_vars.nvars == 1:
-                ret = [ret]
-            
-            for position, key in enumerate(self.output_vars._vars.keys()):
-                self.output_vars[key]._value[idx] = ret[position]
-    
-    @staticmethod
-    def insert_callback_args(callback_args, path, fn_vars):
-        callback_args = list(callback_args)
-        
-        for index, arg in enumerate(callback_args):
-            if isinstance(arg, PATH):
-                callback_args[index] = path
-            elif isinstance(arg, FN_VAR):
-                callback_args[index] = fn_vars[arg.name].value
-        
-        return tuple(callback_args)
-    
-    @staticmethod
-    def insert_callback_kwargs(callback_kwargs, path, fn_vars):
-        callback_kwargs = dict(callback_kwargs)
-        
-        for index, (key, value) in enumerate(callback_kwargs.items()):
-            if isinstance(value, PATH):
-                callback_kwargs[key] = path
-            elif isinstance(value, FN_VAR):
-                callback_kwargs[key] = fn_vars[value.name].value
-        
-        return callback_kwargs
-    
-#    @staticmethod
-#    def check_args(fn_vars, *args, **kwargs):
-#        
-#        for idx, arg in enumerate(args):
-#            if isinstance(arg, Var):
-#                if Var.name in fn_vars.keys():
-#                    args[idx] = fn_vars[arg.name][]
-
-
+            if self.reduction:
+                reduction_args = self.insert_args(self.reduction_args, this_idx)
+                reduction_kwargs = self.insert_kwargs(self.reduction_kwargs, this_idx)
+                
+                self.reduction_vars = self.call(function=self.reduction,
+                                                args=reduction_args,
+                                                kwargs=reduction_kwargs,
+                                                return_vars=self.reduction_vars)
 
 
 
@@ -860,28 +1001,35 @@ if __name__ == "__main__":
                          Var("ExpTime"), "ms,",
                          Var("Power", float), "uW.txt")
     
-    fg = FileGroup.from_directory(path="D:\\! Nube\\Google Drive\\Proyecto OCT\\2019-02-05_Calibracion_espectrometro\\2019-03-18_Calibracion_CW\\prueba\\",
+    fg = FileGroup.from_directory(path="E:\\Axel (Google Drive)\Proyecto OCT\\2019-02-05_Calibracion_espectrometro\\2019-03-18_Calibracion_CW\\prueba",
                                   fn_syntax=fn_syntax)
     
-    def callback(self, path, mode, wavelength, exptime, power):
+    def callback(path, mode, wavelength, exptime, power):
         return path, mode, wavelength, exptime, power
     
-    output_vars = VarGroup(Var("Path", str),
-                           Var("Mode", str),
-                           Var("Wavelength", float),
-                           Var("ExpTime", float),
-                           Var("Power", float))
+    def reduction(length, red_wavelength, red_exptime, red_power, wavelength, exptime, power):
+        red_wavelength += wavelength/length
+        red_exptime += exptime/length
+        red_power += power/length
+        
+        return red_wavelength, red_exptime, red_power
     
-    bt = BatchTask(fg, None, callback,
-                   (Var("Path", str), Var("Mode", str), Var("Wavelength", float), Var("ExpTime", float), Var("Power", float)),
-                   PATH(),
-                   FN_VAR("Mode"),
-                   wavelength=FN_VAR("Wavelength"),
-                   exptime=FN_VAR("ExpTime"),
-                   power=FN_VAR("Power"))
+    bt = BatchTask(files=fg)
+    bt.set_callback(callback,
+                    args=(PATH(), FNVAR("Mode")),
+                    kwargs={"wavelength": FNVAR("Wavelength"), "exptime": FNVAR("ExpTime"), "power": FNVAR("Power")},
+                    return_vars=(Var("Path", str), Var("Mode", str), Var("Wavelength", float), Var("ExpTime", float), Var("Power", float)))
+    
+    bt.set_reduction(reduction,
+                     args=(ATTR("length"), REDVAR("Wavelength"), REDVAR("ExpTime"), REDVAR("Power")),
+                     kwargs={"wavelength": CALVAR("Wavelength"), "exptime": CALVAR("ExpTime"), "power": CALVAR("Power")},
+                     return_vars=(Var("Wavelength", float), Var("ExpTime", float), Var("Power", float)))
+    
     bt.run()
     
-    print(bt.output_vars)
+    print(bt.callback_vars)
+    print(bt.reduction_vars)
+    
 
 
 
