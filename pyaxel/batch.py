@@ -13,10 +13,12 @@ from re import split, sub
 
 from tkinter import Tk, filedialog
 
+from enum import Enum, IntEnum, auto
+
 import sys, os, errno
 from os import listdir
 from os import linesep
-from os.path import normpath, join, abspath
+from os.path import normpath, join, abspath, splitext
 
 ureg = UnitRegistry()
 Q_ = ureg.Quantity
@@ -28,24 +30,39 @@ types = {"s": str,
          "q": Q_}
 
 class PATH:
-    pass
+    def __init__(self):
+        self.__name__ = "PATH"
 
 class ATTR:
     def __init__(self, name):
+        self.__name__ = "ATTR"
         self.name = str(name)
 
 class FNVAR:
     def __init__(self, name):
+        self.__name__ = "FNVAR"
         self.name = str(name)
 
 class CALVAR:
     def __init__(self, name):
+        self.__name__ = "CALVAR"
         self.name = str(name)
 
 class REDVAR:
     def __init__(self, name):
+        self.__name__ = "REDVAR"
         self.name = str(name)
 
+class Array:
+    def __init__(self, size, dtype=float):
+        self.size = size
+        self.dtype = dtype
+
+class ErrorPolicies(IntEnum):
+    STOP = auto()
+    STOP_ON_REPEAT = auto()
+    SKIP = auto()
+    SILENT_SKIP = auto()
 
 def split_path(path):
     from os.path import split, splitext
@@ -248,10 +265,10 @@ class Var:
         self.dtype = dtype
         
         if value is None:
-            self.value = np.array(np.zeros((length, ), dtype=self.dtype), ndmin=1)
             self._length = length
+            self._value = self.initialize(length)
         else:
-            self.value = value
+            self._value = value
             self._length = len(self._value)
     
     def __getitem__(self, key):
@@ -265,6 +282,15 @@ class Var:
             return self._value[0]
         else:
             return self._value
+    
+    def initialize(self, length):
+        if isinstance(self.dtype, Array):
+            size = (length, ) + self.dtype.size
+            
+            init = np.array(np.zeros(size, dtype=self.dtype.dtype), ndmin=1)
+            return init
+        elif isinstance(self.dtype, type):
+            return np.array(np.zeros((length, ), dtype=self.dtype), ndmin=1)
     
     @property
     def name(self):
@@ -285,8 +311,8 @@ class Var:
     
     @dtype.setter
     def dtype(self, value):
-        if not isinstance(value, type):
-            raise TypeError("Dtype must be a valid type.")
+        if not (isinstance(value, type) or isinstance(value, Array)):
+            raise TypeError("Argument dtype must be a valid type.")
 #        elif value is str:
 #            value = object
         
@@ -304,7 +330,7 @@ class Var:
         if value == self.length:
             return
         elif value > self.length:
-            self._value = np.append(self._value, np.zeros((value-self.length, ), dtype=self.dtype))
+            self._value = np.append(self._value, self.initialize(value-self.length), axis=0)
         elif value < self.length:
             self._value = self._value[0:value]
     
@@ -317,7 +343,14 @@ class Var:
     
     @value.setter
     def value(self, value):
-        dtype = self.dtype if (self.dtype is not str) else object # Set dtype to object if string was specified. This allows numpy arrays of strings with variable lengths
+        if isinstance(self.dtype, type):
+            if self.dtype == str:
+                dtype = object
+            else:
+                dtype = self.dtype
+        elif isinstance(self.dtype, Array):
+            dtype = self.dtype.dtype
+        
         value = np.array(value, ndmin=1).astype(dtype)
         self._value = value
 
@@ -389,12 +422,15 @@ class VarGroup:
     def __setitem__(self, key, value):
         if isinstance(key, str):
             self._vars[key].value = value
-        elif isinstance(key, int) or isinstance(key, slice):
+        elif isinstance(key, (int, slice)):
             if not isinstance(value, VarGroup):
                 raise TypeError("Assignement of variable group value must take a VarGroup object.")
             
             for var_key in self._vars.keys():
-                self._vars[var_key]._value[key] = value[var_key].value
+                if self.length == 1:
+                    self._vars[var_key].value = value[var_key].value
+                elif self.length > 1:
+                    self._vars[var_key].value[key] = value[var_key].value
         else:
             raise KeyError("Variable group assignement key must be either string of a variable name or a integer or slice.")
     
@@ -433,6 +469,12 @@ class VarGroup:
     @property
     def dtypes(self):
         return [var.dtype for var in self._vars.values()]
+    
+    def unpack(self):
+        if self.nvars == 1:
+            return tuple(var.value for var in self._vars.values())[0]
+        else:
+            return tuple(var.value for var in self._vars.values())
     
     @staticmethod
     def validate_lengths(*vars):
@@ -534,6 +576,9 @@ class File:
         
         self.fn_syntax = fn_syntax
     
+    def __repr__(self):
+        return "File('{}')".format(self.path, self.fn_syntax)
+    
     @property
     def folder(self):
         return self._folder
@@ -590,7 +635,6 @@ class File:
     def fn_vars(self):
         return self._fn_vars
 
-
 class FileGroup(object):
     
     def __init__(self, files=None, fn_syntax=None):
@@ -629,15 +673,35 @@ class FileGroup(object):
             raise KeyError("File group assignement key must be either int or slice type.")
     
     @classmethod
-    def from_directory(cls, path=None, fn_syntax=None):
-        if path:
-            path = abspath(path)
+    def from_directory(cls, path=None, extension=None, fn_syntax=None):
+        # Convert extension to list
+        if isinstance(extension, type(None)):
+            extension = []
+        elif isinstance(extension, str):
+            extension = [extension]
+        elif isinstance(extension, list):
+            pass
         else:
-            path = file_dialog_dir_open()
+            raise TypeError("Extension must be a string or a list of strings.")
         
-        files = listdir(path)
-        for idx in range(len(files)):
-            files[idx] = join(path, files[idx])
+        # Remove dots from extensions:
+        for idx, ext in enumerate(extension):
+            if ext[0] == ".":
+                extension[idx] = extension[idx][1:]
+        
+        # Add files
+        all_files = listdir(path)
+        files = []
+        
+        for file in all_files:
+            # If no given extension, add all files
+            if not extension:
+                files.append(join(path, file))
+            # If an extension list is given, filter by extension
+            else:
+                this_ext = splitext(file)[1][1:] # Get extension without dot
+                if this_ext in extension:
+                    files.append(join(path, file))
         
         return cls(files=files, fn_syntax=fn_syntax)
     
@@ -791,6 +855,32 @@ class BatchTask:
         
     """
     
+    class ErrorPolicy:
+        def __init__(self, policy, exception_name=None):
+            if isinstance(policy, str):
+                self.policy = ErrorPolicies[policy.upper()]
+            elif isinstance(policy, int):
+                self.policy = ErrorPolicies(policy)
+            elif isinstance(policy, type(ErrorPolicies(1))):
+                self.policy = policy
+            else:
+                raise TypeError("Argument 'policy' must be a string or a ErrorPolicies enum item. See 'Batch.ErrorPolicies'.")
+            
+            if not exception_name:
+                self.exception_name = []
+            elif isinstance(exception_name, str):
+                self.exception_name = [exception_name]
+            elif isinstance(exception_name, list):
+                self.exception_name = []
+                
+                for name in exception_name:
+                    if isinstance(name, str):
+                        self.exception_name.append(name)
+                    else:
+                        raise TypeError("Exception name must be a string or a list of strings.")
+            else:
+                raise TypeError("Exception name must be eithr a string or a list of strings.")
+    
     def __init__(
             self, files,
             fn_syntax=None,
@@ -820,6 +910,10 @@ class BatchTask:
         self.reduction_kwargs = reduction_kwargs
         self.reduction_vars = reduction_vars
         
+        self.error_policy = ErrorPolicies.STOP
+        
+        # If keep_callback_returns is not specified, set its value according to
+        # if there is a reduction method assigned or not
         if not (keep_callback_returns is None):
             self.keep_callback_returns = keep_callback_returns
         else:
@@ -859,6 +953,31 @@ class BatchTask:
             self.callback_vars.length = 1
     
     @property
+    def error_policy(self):
+        return self._error_policy
+    
+    @error_policy.setter
+    def error_policy(self, value):
+        if isinstance(value, type(ErrorPolicies(1))):
+            self._error_policy = self.ErrorPolicy(value)
+        elif isinstance(value, str):
+            self._error_policy = self.ErrorPolicy(value)
+        elif isinstance(value, int):
+            self._error_policy = self.ErrorPolicy(value)
+        elif isinstance(value, self.ErrorPolicy):
+            self._error_policy = value
+        else:
+            raise TypeError("Error policy must be either a string, an integer, an ErrorPolicy object or an ErrorPolicies item.")
+        
+        self._last_error = None
+        self._files_with_errors = {"paths": [],
+                                   "indices": []}
+    
+    @property
+    def files_with_errors(self):
+        return self._files_with_errors
+    
+    @property
     def callback_vars(self):
         return self._callback_vars
     
@@ -885,7 +1004,7 @@ class BatchTask:
     @reduction_vars.setter
     def reduction_vars(self, value):
         if value is None:
-            self._reduction_vars = VarGroup.from_props(names=["reduction"], dtypes=[type(None)], length=self.length)
+            self._reduction_vars = VarGroup.from_props(names=["reduction"], dtypes=[type(None)], length=1)
         elif isinstance(value, VarGroup):
             self._reduction_vars = value
             self._reduction_vars.length = 1
@@ -923,15 +1042,15 @@ class BatchTask:
             args = []
         
         for index, arg in enumerate(args):
-            if isinstance(arg, PATH):
+            if isinstance(arg, PATH) or (isinstance(arg, type) and arg.__name__ == "PATH"):
                 args[index] = self.files[file_index].path
-            if isinstance(arg, ATTR):
+            if isinstance(arg, ATTR) or (isinstance(arg, type) and arg.__name__ == "ATTR"):
                 args[index] = self.__getattribute__(arg.name)
-            if isinstance(arg, FNVAR):
+            if isinstance(arg, FNVAR) or (isinstance(arg, type) and arg.__name__ == "FNVAR"):
                 args[index] = self.files[file_index].fn_vars[arg.name].value
-            if isinstance(arg, CALVAR):
+            if isinstance(arg, CALVAR) or (isinstance(arg, type) and arg.__name__ == "CALVAR"):
                 args[index] = self.callback_vars[file_index][arg.name].value
-            if isinstance(arg, REDVAR):
+            if isinstance(arg, REDVAR) or (isinstance(arg, type) and arg.__name__ == "REDVAR"):
                 args[index] = self.reduction_vars[arg.name].value
         
         return tuple(args)
@@ -961,12 +1080,59 @@ class BatchTask:
         ret = function(*args, **kwargs)
         
         if return_vars.nvars == 1:
-            ret = [ret]
+            ret = (ret, )
         
         for position, key in enumerate(return_vars._vars.keys()):
-            return_vars[key].value = ret[position]
+            return_vars[key] = ret[position]
         
         return return_vars
+    
+    def handle_error(self, exception, file, file_idx):
+        exception_name = exception.__class__.__name__
+        
+        if self.error_policy.policy == ErrorPolicies.STOP:
+            # Will only stop if exception name matches specified exception_name
+            if exception_name in self.error_policy.exception_name or not self.error_policy.exception_name:
+                self._last_error = exception.__class__.__name__
+                self._files_with_errors["paths"].append(file.path)
+                self._files_with_errors["indices"].append(file_idx)
+                
+                raise exception
+            else:
+                print(exception)
+        
+        elif self.error_policy.policy == ErrorPolicies.STOP_ON_REPEAT:
+            # Will only stop if exception name matches specified exception_name
+            # and that exception was raised before
+            if exception_name in self.error_policy.exception_name or not self.error_policy.exception_name:
+                last_error = self._last_error
+                self._last_error = exception_name
+                self._files_with_errors["paths"].append(file.path)
+                self._files_with_errors["indices"].append(file_idx)
+                
+                if last_error == exception_name:
+                    raise exception
+            else:
+                print(exception)
+        
+        elif self.error_policy.policy == ErrorPolicies.SKIP:
+            # Will skip exceptions that matches matches exception_name
+            if exception_name in self.error_policy.exception_name or not self.error_policy.exception_name:
+                self._last_error = exception_name
+                self._files_with_errors["paths"].append(file.path)
+                self._files_with_errors["indices"].append(file_idx)
+                print(exception)
+            else:
+                raise exception
+        
+        elif self.error_policy.policy == ErrorPolicies.SILENT_SKIP:
+            # Will skip exceptions that matches matches exception_name
+            if exception_name in self.error_policy.exception_name or not self.error_policy.exception_name:
+                self._last_error = exception_name
+                self._files_with_errors["paths"].append(file.path)
+                self._files_with_errors["indices"].append(file_idx)
+            else:
+                raise exception
     
     def run(self):
         for idx, file in enumerate(self.files):
@@ -977,20 +1143,26 @@ class BatchTask:
             callback_kwargs = self.insert_kwargs(self.callback_kwargs, idx)
             
             this_idx = idx if self.keep_callback_returns else 0 # Override index to override callback returns
-            self.callback_vars[this_idx] = self.call(function=self.callback,
-                                                   args=callback_args,
-                                                   kwargs=callback_kwargs,
-                                                   return_vars=self.callback_vars)
             
-            if self.reduction:
-                reduction_args = self.insert_args(self.reduction_args, this_idx)
-                reduction_kwargs = self.insert_kwargs(self.reduction_kwargs, this_idx)
+            try:
+                self.callback_vars[this_idx] = self.call(function=self.callback,
+                                                         args=callback_args,
+                                                         kwargs=callback_kwargs,
+                                                         return_vars=self.callback_vars)
+            except Exception as exception:
+                self.handle_error(exception, file, idx)
                 
-                self.reduction_vars = self.call(function=self.reduction,
-                                                args=reduction_args,
-                                                kwargs=reduction_kwargs,
-                                                return_vars=self.reduction_vars)
-
+            try:
+                if self.reduction:
+                    reduction_args = self.insert_args(self.reduction_args, this_idx)
+                    reduction_kwargs = self.insert_kwargs(self.reduction_kwargs, this_idx)
+                    
+                    self.reduction_vars = self.call(function=self.reduction,
+                                                    args=reduction_args,
+                                                    kwargs=reduction_kwargs,
+                                                    return_vars=self.reduction_vars)
+            except Exception as exception:
+                self.handle_error(exception, file, idx)
 
 
 if __name__ == "__main__":
@@ -1024,6 +1196,8 @@ if __name__ == "__main__":
                      args=(ATTR("length"), REDVAR("Wavelength"), REDVAR("ExpTime"), REDVAR("Power")),
                      kwargs={"wavelength": CALVAR("Wavelength"), "exptime": CALVAR("ExpTime"), "power": CALVAR("Power")},
                      return_vars=(Var("Wavelength", float), Var("ExpTime", float), Var("Power", float)))
+    
+    bt.error_policy = bt.ErrorPolicy("stop_on_repeat", ["AttributeError"])
     
     bt.run()
     
